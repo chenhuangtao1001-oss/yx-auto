@@ -509,8 +509,16 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         }
     }
 
+    async function addPreferredNodes(list) {
+        const useVL = evEnabled || (!etEnabled && !vmEnabled);
+        const filtered = disableNonTLS ? list.filter(item => ![80,8080,8880,2052,2082,2086,2095].includes(Number(item.port))) : list;
+        if (useVL) finalLinks.push(...generateLinksFromSource(filtered, user, nodeDomain, disableNonTLS, wsPath, echConfig));
+        if (etEnabled) finalLinks.push(...await generateTrojanLinksFromSource(filtered, user, nodeDomain, disableNonTLS, wsPath, echConfig));
+        if (vmEnabled) finalLinks.push(...generateVMessLinksFromSource(filtered, user, nodeDomain, disableNonTLS, wsPath, echConfig));
+    }
+
     // 原生地址
-    const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
+    const nativeList = [{ ip: nodeDomain, isp: '原生地址' }];
     await addNodesFromList(nativeList);
 
     // 优选域名
@@ -559,12 +567,7 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
                     }).filter(item => item !== null);
                     
                     if (IP列表.length > 0) {
-                        const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                        const useVL = hasProtocol ? evEnabled : true;
-                        
-                        if (useVL) {
-                            finalLinks.push(...generateLinksFromNewIPs(IP列表, user, nodeDomain, wsPath, echConfig));
-                        }
+                        await addPreferredNodes(IP列表);
                     }
                 }
             } else if (piu && piu.includes('\n')) {
@@ -608,24 +611,14 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
                     }).filter(item => item !== null);
                     
                     if (IP列表.length > 0) {
-                        const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                        const useVL = hasProtocol ? evEnabled : true;
-                        
-                        if (useVL) {
-                            finalLinks.push(...generateLinksFromNewIPs(IP列表, user, nodeDomain, wsPath, echConfig));
-                        }
+                        await addPreferredNodes(IP列表);
                     }
                 }
             } else {
                 // 原有的GitHub优选逻辑（单URL）
                 const newIPList = await fetchAndParseNewIPs(piu);
                 if (newIPList.length > 0) {
-                    const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                    const useVL = hasProtocol ? evEnabled : true;
-                    
-                    if (useVL) {
-                        finalLinks.push(...generateLinksFromNewIPs(newIPList, user, nodeDomain, wsPath, echConfig));
-                    }
+                    await addPreferredNodes(newIPList);
                 }
             }
         } catch (error) {
@@ -670,61 +663,43 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
     });
 }
 
-// 生成Clash配置（简化版，返回YAML格式）
+// 原生 Clash JSON（JSON 同样是合法 YAML）；不发送凭据至转换服务。
 function generateClashConfig(links) {
-    let yaml = 'port: 7890\n';
-    yaml += 'socks-port: 7891\n';
-    yaml += 'allow-lan: false\n';
-    yaml += 'mode: rule\n';
-    yaml += 'log-level: info\n\n';
-    yaml += 'proxies:\n';
-    
-    const proxyNames = [];
-    links.forEach((link, index) => {
-        const name = decodeURIComponent(link.split('#')[1] || `节点${index + 1}`);
-        proxyNames.push(name);
-        const server = link.match(/@([^:]+):(\d+)/)?.[1] || '';
-        const port = link.match(/@[^:]+:(\d+)/)?.[1] || '443';
-        const uuid = link.match(/vless:\/\/([^@]+)@/)?.[1] || '';
-        const tls = link.includes('security=tls');
-        const path = link.match(/path=([^&#]+)/)?.[1] || '/';
-        const host = link.match(/host=([^&#]+)/)?.[1] || '';
-        const sni = link.match(/sni=([^&#]+)/)?.[1] || '';
-        const echParam = link.match(/[?&]ech=([^&#]+)/)?.[1];
-        const echDomain = echParam ? decodeURIComponent(echParam).split('+')[0] : '';
-        
-        yaml += `  - name: ${name}\n`;
-        yaml += `    type: vless\n`;
-        yaml += `    server: ${server}\n`;
-        yaml += `    port: ${port}\n`;
-        yaml += `    uuid: ${uuid}\n`;
-        yaml += `    tls: ${tls}\n`;
-        yaml += `    network: ws\n`;
-        yaml += `    ws-opts:\n`;
-        yaml += `      path: ${path}\n`;
-        yaml += `      headers:\n`;
-        yaml += `        Host: ${host}\n`;
-        if (sni) {
-            yaml += `    servername: ${sni}\n`;
+    const proxies = links.map((link, index) => {
+        let node;
+        if (link.startsWith('vmess://')) {
+            const v = JSON.parse(decodeURIComponent(escape(atob(link.slice(8)))));
+            node = { name: v.ps || `节点${index + 1}`, type: 'vmess', server: v.add,
+                port: Number(v.port), uuid: v.id, alterId: Number(v.aid || 0), cipher: v.scy || 'auto',
+                tls: v.tls === 'tls', servername: v.sni || v.host, network: v.net || 'ws',
+                'ws-opts': { path: v.path || '/', headers: { Host: v.host || v.sni || '' } } };
+        } else {
+            const u = new URL(link), q = u.searchParams;
+            const type = u.protocol.slice(0, -1);
+            if (!['vless', 'trojan'].includes(type)) return null;
+            node = { name: decodeURIComponent(u.hash.slice(1)) || `节点${index + 1}`, type,
+                server: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port || 443),
+                network: q.get('type') || 'ws', 'client-fingerprint': q.get('fp') || 'chrome',
+                'ws-opts': { path: q.get('path') || '/', headers: { Host: q.get('host') || q.get('sni') || '' } } };
+            if (type === 'trojan') {
+                node.password = decodeURIComponent(u.username);
+                node.sni = q.get('sni') || q.get('host') || node.server;
+            } else {
+                node.uuid = decodeURIComponent(u.username);
+                node.tls = q.get('security') === 'tls';
+                node.servername = q.get('sni') || q.get('host') || node.server;
+            }
+            if (q.get('ech')) node['ech-opts'] = { enable: true, 'query-server-name': q.get('ech').split('+')[0] };
         }
-        if (echDomain) {
-            yaml += `    ech-opts:\n`;
-            yaml += `      enable: true\n`;
-            yaml += `      query-server-name: ${echDomain}\n`;
-        }
-    });
-    
-    yaml += '\nproxy-groups:\n';
-    yaml += '  - name: PROXY\n';
-    yaml += '    type: select\n';
-    yaml += `    proxies: [${proxyNames.map(n => `'${n}'`).join(', ')}]\n`;
-    yaml += '\nrules:\n';
-    yaml += '  - DOMAIN-SUFFIX,local,DIRECT\n';
-    yaml += '  - IP-CIDR,127.0.0.0/8,DIRECT\n';
-    yaml += '  - GEOIP,CN,DIRECT\n';
-    yaml += '  - MATCH,PROXY\n';
-    
-    return yaml;
+        node['skip-cert-verify'] = false;
+        return node;
+    }).filter(Boolean);
+    const used = new Set();
+    proxies.forEach((p, i) => { if (used.has(p.name)) p.name += `-${i + 1}`; used.add(p.name); });
+    return JSON.stringify({ 'mixed-port': 7890, 'allow-lan': false, mode: 'rule', 'log-level': 'info',
+        proxies, 'proxy-groups': [{ name: 'PROXY', type: 'select', proxies: [...proxies.map(p => p.name), 'DIRECT'] }],
+        rules: ['DOMAIN-SUFFIX,local,DIRECT', 'IP-CIDR,127.0.0.0/8,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,PROXY']
+    }, null, 2);
 }
 
 // 生成Surge配置
@@ -1458,7 +1433,7 @@ function generateHomePage(scuValue) {
             }
             
             // 添加协议选择
-            if (switches.switchVL) subscriptionUrl += '&ev=yes';
+            subscriptionUrl += switches.switchVL ? '&ev=yes' : '&ev=no';
             if (switches.switchTJ) subscriptionUrl += '&et=yes';
             if (switches.switchVM) subscriptionUrl += '&mess=yes';
             
@@ -1521,7 +1496,7 @@ function generateHomePage(scuValue) {
                 }
             } else {
                 const encodedUrl = encodeURIComponent(subscriptionUrl);
-                finalUrl = SUB_CONVERTER_URL + '?target=' + clientType + '&url=' + encodedUrl + '&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true';
+                finalUrl = clientType === 'clash' ? subscriptionUrl + '&target=clash' : SUB_CONVERTER_URL + '?target=' + clientType + '&url=' + encodedUrl + '&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true';
                 
                 const urlElement = document.getElementById('clientSubscriptionUrl');
                 urlElement.textContent = finalUrl;
