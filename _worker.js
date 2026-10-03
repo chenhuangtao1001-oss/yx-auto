@@ -367,7 +367,7 @@ async function generateTrojanLinksFromSource(list, user, workerDomain, disableNo
                     wsParams.set('alpn', 'h3,h2,http/1.1');
                     wsParams.set('ech', echConfig);
                 }
-                links.push(`trojan://${password}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
+                links.push(`trojan://${encodeURIComponent(password)}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
             } else {
                 const wsNodeName = `${nodeNameBase}-${port}-Trojan-WS`;
                 const wsParams = new URLSearchParams({
@@ -376,7 +376,7 @@ async function generateTrojanLinksFromSource(list, user, workerDomain, disableNo
                     host: workerDomain,
                     path: wsPath
                 });
-                links.push(`trojan://${password}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
+                links.push(`trojan://${encodeURIComponent(password)}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
             }
         });
     });
@@ -1615,7 +1615,7 @@ export default {
         // 订阅请求格式: /{UUID或Password}/sub?domain=xxx&epd=yes&epi=yes&egi=yes
         const pathMatch = path.match(/^\/([^\/]+)\/sub$/);
         if (pathMatch) {
-            const uuid = pathMatch[1];
+            const uuid = decodeURIComponent(pathMatch[1]);
             
             const domain = url.searchParams.get('domain');
             if (!domain) {
